@@ -1,6 +1,7 @@
 import asyncio
 import os
 import logging
+import re
 from playwright.async_api import async_playwright, expect, Page, BrowserContext, Browser
 from typing import Optional, Dict, Any, Union
 
@@ -251,14 +252,17 @@ class OuraAutomator:
 
     async def _check_otp_screen(self):
         """Checks if OTP screen is active and handles the 'Send Code' intermediate step if present."""
-        # Check for "Send code" intermediate page
-        intermediate_btn = self.page.locator("button[name='selectedId']")
+        # Passkey and email-code buttons share selectedId. Select the email
+        # action by its accessible name instead of relying on button order.
+        intermediate_btn = self.page.get_by_role(
+            "button", name=re.compile(r"^(Email me a code|Send code)$", re.IGNORECASE)
+        )
         otp_input_name = self.page.locator("input[name='otp']")
         otp_input_id = self.page.locator("#otp-code")
 
-        if await intermediate_btn.is_visible() and \
-           not await otp_input_name.is_visible() and \
-           not await otp_input_id.is_visible():
+        if not await otp_input_name.is_visible() and \
+           not await otp_input_id.is_visible() and \
+           await intermediate_btn.is_visible():
             logger.info("Found intermediate 'Send Code' button. Clicking...")
             await intermediate_btn.click()
             await self.page.wait_for_timeout(3000)
