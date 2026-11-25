@@ -15,7 +15,7 @@ def automator_class(monkeypatch, tmp_path):
         return importlib.import_module('backend.src.automation').OuraAutomator
 
 
-@pytest.mark.parametrize('html,request,pending,expected', [
+@pytest.mark.parametrize('html,request_new,pending,expected', [
     ('<button>Request your data</button>', False, False, 'no_export'),
     ('<button>Request your data</button>', True, False, 'pending'),
     ('<button>Request your data</button>', True, True, 'pending'),
@@ -23,7 +23,7 @@ def automator_class(monkeypatch, tmp_path):
     ('<button disabled>Request your data</button>', True, False, 'pending'),
     ('<span>Pending</span><button aria-label="Download data">Old ZIP</button>', True, True, 'pending'),
 ])
-def test_export_state_and_request_dedup(automator_class, tmp_path, html, request, pending, expected):
+def test_export_state_and_request_dedup(automator_class, tmp_path, html, request_new, pending, expected):
     async def scenario():
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch()
@@ -35,11 +35,11 @@ def test_export_state_and_request_dedup(automator_class, tmp_path, html, request
                 automator.page = page
                 automator._navigate_to_export_page = AsyncMock(return_value=True)
                 checkpoint = []
-                result = await automator.check_export(str(tmp_path), request_if_missing=request,
+                result = await automator.check_export(str(tmp_path), request_if_missing=request_new,
                     export_pending=pending, before_request=lambda: checkpoint.append(True))
                 assert result['status'] == expected
                 clicked = await page.evaluate('window.clicked')
-                should_click = request and not pending and html == '<button>Request your data</button>'
+                should_click = request_new and not pending and html == '<button>Request your data</button>'
                 assert clicked == (['Request your data'] if should_click else [])
                 assert checkpoint == ([True] if should_click else [])
             finally:
