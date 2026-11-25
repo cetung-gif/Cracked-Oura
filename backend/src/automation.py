@@ -382,8 +382,16 @@ class OuraAutomator:
             if before_request:
                 before_request()
             await request.click(timeout=10000)
-            # Persisting before the click makes an interrupted submission safe.
-            return {"status": "pending", "requested": True}
+            # A SPA click can return before the request reaches Oura. Keep the
+            # browser alive for confirmation instead of cancelling its POST.
+            for _ in range(20):
+                if await self._export_is_pending():
+                    return {"status": "pending", "requested": True}
+                if await download.is_visible() and await download.is_enabled():
+                    return {"status": "downloaded", "path": await self._download_file(save_dir)}
+                await self.page.wait_for_timeout(500)
+            # Never submit twice when the outcome is uncertain.
+            return {"status": "pending", "request_unconfirmed": True}
         if await request.is_visible() or await download.is_visible():
             return {"status": "no_export"}
         raise RuntimeError("Could not identify Oura's export controls. Open the export page to check its status.")

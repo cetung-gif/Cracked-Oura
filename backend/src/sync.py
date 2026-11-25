@@ -188,6 +188,7 @@ class SyncService:
                         self.set_status("otp_needed", "Sync paused. Enter the code sent to your email.", pending_action=action)
                         return
                     if result.get("status") in {"pending", "no_export", "downloaded"}:
+                        await self.automator.save_context()
                         self.config.update_config(last_checked_at=self.now().isoformat())
                         # A successful manual check after today's scheduled
                         # time also satisfies that day's check.
@@ -197,6 +198,8 @@ class SyncService:
                             self.config.update_config(last_schedule_day=now.date().isoformat())
                     if result.get("status") == "pending":
                         self.mark_waiting()
+                        if result.get("request_unconfirmed"):
+                            self.config.update_config(message="Oura has not confirmed the request yet. Check its export page; the app will check again without submitting a duplicate.")
                         return
                     if result.get("status") == "no_export":
                         self.set_status("idle", "No export is available yet. Use Request New to prepare one.",
@@ -229,7 +232,10 @@ class SyncService:
                             self.set_status("otp_needed", "Enter your email code to continue.", pending_action=action)
                             return
                         if result.get("status") == "pending":
+                            await self.automator.save_context()
                             self.mark_waiting()
+                            if result.get("request_unconfirmed"):
+                                self.config.update_config(message="Oura has not confirmed the request yet. Check its export page; the app will check again without submitting a duplicate.")
                             return
                         if result.get("status") != "no_export":
                             raise RuntimeError(result.get("message", "Could not request a fresh export."))
