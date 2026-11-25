@@ -47,6 +47,11 @@ class SyncService:
             self.set_status("login_needed", "Sign in again to request a fresh code; the app was restarted.")
         elif state["status"] in BUSY_STATUSES:
             self.set_status("idle", "The previous job was interrupted. You can retry it.", pending_action="")
+        elif state["status"] == "error":
+            # A failure from a previous process is history, not a new failure
+            # caused by opening the app. Retain the detail for diagnostics.
+            self.set_status("idle", "Ready to sync.", pending_action="",
+                            previous_sync_error=state["message"])
 
     def require_available(self):
         if self.lock.locked() or self.snapshot()["status"] in BUSY_STATUSES:
