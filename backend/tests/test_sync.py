@@ -1,6 +1,8 @@
 import asyncio
 import ast
 from pathlib import Path
+from datetime import datetime, timedelta
+import hashlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -28,14 +30,13 @@ def service(**state):
         start_login=AsyncMock(return_value={"status": "otp_required"}),
         submit_otp=AsyncMock(return_value={"status": "success"}),
         clear_session=AsyncMock(), cleanup=AsyncMock(),
-        request_new_export_and_download=AsyncMock(return_value={"status": "otp_required"}),
-        download_existing_export=AsyncMock(return_value={"status": "otp_required"}),
+        check_export=AsyncMock(return_value={"status": "otp_required"}),
     )
     return SyncService(browser, MemoryConfig(**state), AsyncMock())
 
 
 @pytest.mark.parametrize("action", ["export", "download"])
-def test_pause_authenticate_and_resume_original_job(action):
+def test_pause_authenticate_and_resume_original_job(action, tmp_path):
     async def scenario():
         sync = service()
         await sync.run(action)
@@ -45,17 +46,16 @@ def test_pause_authenticate_and_resume_original_job(action):
 
         # A scheduled run cannot navigate away from the code-entry page.
         await sync.run("export", scheduled=True)
-        assert sync.automator.request_new_export_and_download.await_count == (action == "export")
-        assert sync.automator.download_existing_export.await_count == (action == "download")
+        assert sync.automator.check_export.await_count == 1
 
         result, resume = await sync.submit_otp("123456")
         assert resume == action
         assert result["status"] in {"exporting", "downloading"}
-        operation = (sync.automator.request_new_export_and_download if action == "export"
-                     else sync.automator.download_existing_export)
-        operation.return_value = "/tmp/export.zip"
+        export = tmp_path / "export.zip"
+        export.write_bytes(b"test export")
+        sync.automator.check_export.return_value = {"status": "downloaded", "path": str(export)}
         await sync.run(resume)
-        sync.ingest.assert_awaited_once_with("/tmp/export.zip")
+        sync.ingest.assert_awaited_once_with(str(export))
         sync.automator.cleanup.assert_awaited_once()
         assert sync.snapshot()["status"] == "completed"
         assert sync.snapshot()["pending_action"] == ""
@@ -78,7 +78,7 @@ def test_invalid_otp_preserves_form_browser_and_pending_job():
 def test_error_details_are_returned_and_browser_is_closed():
     async def scenario():
         sync = service()
-        sync.automator.download_existing_export.side_effect = RuntimeError("Network unavailable")
+        sync.automator.check_export.side_effect = RuntimeError("Network unavailable")
         await sync.run("download")
         assert sync.snapshot()["status"] == "error"
         assert sync.snapshot()["message"] == "Network unavailable"
@@ -89,7 +89,7 @@ def test_error_details_are_returned_and_browser_is_closed():
 def test_error_result_is_not_ingested_as_a_file():
     async def scenario():
         sync = service()
-        sync.automator.download_existing_export.return_value = {"status": "error", "message": "Session expired"}
+        sync.automator.check_export.return_value = {"status": "error", "message": "Session expired"}
         await sync.run("download")
         sync.ingest.assert_not_awaited()
         assert sync.snapshot()["message"] == "Session expired"
@@ -113,18 +113,18 @@ def test_no_concurrent_sync_or_login_while_job_is_running():
     async def scenario():
         sync = service()
         entered, finish = asyncio.Event(), asyncio.Event()
-        async def download(directory):
+        async def download(directory, **kwargs):
             entered.set()
             await finish.wait()
             return None
-        sync.automator.download_existing_export.side_effect = download
+        sync.automator.check_export.side_effect = download
         task = asyncio.create_task(sync.run("download"))
         await entered.wait()
         try:
             with pytest.raises(RuntimeError, match="already running"):
                 await sync.start_login("test@example.invalid")
             await sync.run("export", scheduled=True)
-            sync.automator.request_new_export_and_download.assert_not_awaited()
+            assert sync.automator.check_export.await_count == 1
         finally:
             finish.set()
             await task
@@ -135,7 +135,7 @@ def test_disabled_schedule_does_not_request_exports():
     async def scenario():
         sync = service(is_active=False)
         await sync.run("export", scheduled=True)
-        sync.automator.request_new_export_and_download.assert_not_awaited()
+        sync.automator.check_export.assert_not_awaited()
     asyncio.run(scenario())
 
 
@@ -190,8 +190,154 @@ def test_new_error_after_restart_is_still_reported():
     async def scenario():
         sync = service(status="error", message="Old timeout")
         sync.reset_after_restart()
-        sync.automator.download_existing_export.side_effect = RuntimeError("New network failure")
+        sync.automator.check_export.side_effect = RuntimeError("New network failure")
         await sync.run("download")
         assert sync.snapshot()["status"] == "error"
         assert sync.snapshot()["message"] == "New network failure"
     asyncio.run(scenario())
+
+
+def test_pending_export_survives_restart_and_days_of_waiting():
+    async def scenario():
+        sync = service()
+        clock = [datetime(2026, 11, 25, 11)]
+        sync.now = lambda: clock[0]
+        sync.automator.check_export.return_value = {"status": "pending"}
+        await sync.run('export')
+        assert sync.snapshot()['status'] == 'waiting_export'
+        assert sync.snapshot()['export_pending'] is True
+        first_check = sync.snapshot()['last_checked_at']
+        assert sync.snapshot()['data_through'] is None
+        sync = SyncService(sync.automator, MemoryConfig(**sync.config.get_config()), sync.ingest,
+                           now=lambda: clock[0])
+        sync.reset_after_restart()
+        clock[0] += timedelta(days=3)
+        await sync.tick()
+        assert sync.automator.check_export.call_args.kwargs['export_pending'] is True
+        assert sync.snapshot()['status'] == 'waiting_export'
+        assert sync.snapshot()['last_checked_at'] != first_check
+        assert sync.snapshot()['data_through'] is None
+        sync.ingest.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+def test_request_is_checkpointed_before_submission_can_fail():
+    async def scenario():
+        sync = service()
+        async def request(directory, **options):
+            options['before_request']()
+            assert sync.config.get_config()['export_pending'] is True
+            raise RuntimeError('Connection lost after click')
+        sync.automator.check_export.side_effect = request
+        await sync.run('export')
+        assert sync.snapshot()['export_pending'] is True
+        sync.reset_after_restart()
+        assert sync.snapshot()['status'] == 'waiting_export'
+        sync.automator.check_export.side_effect = None
+        sync.automator.check_export.return_value = {'status': 'pending'}
+        await sync.tick()
+        assert sync.automator.check_export.call_args.kwargs['export_pending'] is True
+    asyncio.run(scenario())
+
+
+def test_existing_download_is_imported_before_another_request(tmp_path):
+    async def scenario():
+        export = tmp_path / 'data.zip'
+        export.write_bytes(b'new export')
+        sync = service()
+        sync.now = lambda: datetime(2026, 11, 25, 13)
+        sync.automator.check_export.return_value = {'status': 'downloaded', 'path': str(export)}
+        sync.ingest.return_value = {'data_through': '2026-11-23'}
+        await sync.run('export')
+        sync.automator.check_export.assert_awaited_once()
+        assert sync.snapshot()['data_through'] == '2026-11-23'
+        assert sync.snapshot()['last_checked_at'].startswith('2026-11-25')
+        assert sync.snapshot()['last_imported_at'].startswith('2026-11-25')
+        assert sync.snapshot()['export_pending'] is False
+    asyncio.run(scenario())
+
+
+def test_old_download_does_not_complete_a_pending_new_request(tmp_path):
+    async def scenario():
+        export = tmp_path / 'old.zip'
+        export.write_bytes(b'old export')
+        sync = service(export_pending=True, last_export_digest=hashlib.sha256(export.read_bytes()).hexdigest())
+        sync.automator.check_export.return_value = {'status': 'downloaded', 'path': str(export)}
+        await sync.run('export')
+        sync.ingest.assert_not_awaited()
+        sync.automator.check_export.assert_awaited_once()
+        assert sync.snapshot()['export_pending'] is True
+        assert sync.snapshot()['status'] == 'waiting_export'
+    asyncio.run(scenario())
+
+
+def test_known_download_can_trigger_one_new_request(tmp_path):
+    async def scenario():
+        export = tmp_path / 'old.zip'
+        export.write_bytes(b'old export')
+        sync = service(last_export_digest=hashlib.sha256(export.read_bytes()).hexdigest())
+        sync.automator.check_export.side_effect = [
+            {'status': 'downloaded', 'path': str(export)}, {'status': 'pending', 'requested': True}]
+        await sync.run('export')
+        assert sync.automator.check_export.await_count == 2
+        assert sync.automator.check_export.call_args.kwargs['skip_download'] is True
+        sync.ingest.assert_not_awaited()
+        assert sync.snapshot()['status'] == 'waiting_export'
+    asyncio.run(scenario())
+
+
+def test_pending_check_is_not_repeated_until_its_due_time():
+    async def scenario():
+        sync = service(export_pending=True, status='waiting_export', next_export_check_at='2026-11-25T14:00:00')
+        sync.now = lambda: datetime(2026, 11, 25, 13)
+        await sync.tick()
+        sync.automator.check_export.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+def test_missed_daily_run_catches_up_once_after_wake():
+    async def scenario():
+        sync = service(last_schedule_day='2026-11-24', schedule_time='11:00')
+        sync.now = lambda: datetime(2026, 11, 25, 14, 30)
+        sync.automator.check_export.return_value = {'status':'no_export'}
+        await sync.tick()
+        await sync.tick()
+        sync.automator.check_export.assert_awaited_once()
+        assert sync.config.get_config()['last_schedule_day'] == '2026-11-25'
+    asyncio.run(scenario())
+
+
+def test_missed_yesterday_run_can_catch_up_before_todays_schedule():
+    async def scenario():
+        sync = service(last_schedule_day='2026-11-23', schedule_time='11:00')
+        sync.now = lambda: datetime(2026, 11, 25, 8)
+        sync.automator.check_export.return_value = {'status':'no_export'}
+        await sync.tick()
+        assert sync.config.get_config()['last_schedule_day'] == '2026-11-24'
+    asyncio.run(scenario())
+
+
+def test_new_installation_waits_for_first_scheduled_time():
+    async def scenario():
+        sync = service(schedule_time='11:00')
+        sync.now = lambda: datetime(2026, 11, 25, 8)
+        await sync.tick()
+        sync.automator.check_export.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+def test_pending_exports_still_pause_for_authentication():
+    async def scenario():
+        sync = service(export_pending=True, status='waiting_export')
+        await sync.tick()
+        assert sync.snapshot()['status'] == 'otp_needed'
+        assert sync.snapshot()['export_pending'] is True
+        await sync.tick()
+        sync.automator.check_export.assert_awaited_once()
+    asyncio.run(scenario())
+
+
+def test_reimporting_older_data_does_not_move_freshness_backwards():
+    sync = service(data_through='2026-11-24')
+    sync.record_import({'data_through':'2026-11-20'})
+    assert sync.snapshot()['data_through'] == '2026-11-24'
