@@ -1,8 +1,9 @@
 const BASE_URL = 'http://localhost:8000';
 
 export interface AutomationStatusResponse {
-    status: 'idle' | 'login_needed' | 'otp_needed' | 'logged_in' | 'exporting' | 'ready_to_download' | 'downloading' | 'completed' | 'error';
+    status: 'idle' | 'login_needed' | 'otp_needed' | 'logged_in' | 'exporting' | 'ready_to_download' | 'downloading' | 'completed' | 'error' | 'initializing';
     message?: string;
+    pending_action?: 'export' | 'download' | '';
 }
 
 export interface ChatMessage {
@@ -35,7 +36,7 @@ export const api = {
         return res.json();
     },
 
-    startLogin: async (email: string) => {
+    startLogin: async (email: string): Promise<AutomationStatusResponse> => {
         const res = await fetch(`${BASE_URL}/api/automation/start-login`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -46,7 +47,7 @@ export const api = {
         return data;
     },
 
-    submitOtp: async (otp: string) => {
+    submitOtp: async (otp: string): Promise<AutomationStatusResponse> => {
         const res = await fetch(`${BASE_URL}/api/automation/submit-otp`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -57,7 +58,7 @@ export const api = {
         return data;
     },
 
-    requestExport: async () => {
+    requestExport: async (): Promise<AutomationStatusResponse> => {
         const res = await fetch(`${BASE_URL}/api/automation/request-export`, { method: 'POST' });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || 'Export request failed');
@@ -70,7 +71,7 @@ export const api = {
         return res.json();
     },
 
-    downloadExport: async () => {
+    downloadExport: async (): Promise<AutomationStatusResponse> => {
         const res = await fetch(`${BASE_URL}/api/automation/download`, { method: 'POST' });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || 'Download failed');

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -22,6 +22,11 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
     const [logs, setLogs] = useState<string[]>([]);
     const [activeTab, setActiveTab] = useState<'automation' | 'layout'>('automation');
 
+    const [statusMessage, setStatusMessage] = useState('');
+    const lastSnapshot = useRef('');
+    const initialFailure = useRef<string | null>(null);
+    const busy = loading || ['exporting', 'downloading', 'initializing'].includes(status);
+
     const [dailySyncTime, setDailySyncTime] = useState("09:00");
 
     useEffect(() => {
@@ -34,7 +39,43 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
             .catch(err => console.error("Failed to fetch settings", err));
     }, []);
 
-    const addLog = (msg: string) => setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
+    const addLog = useCallback((msg: string) => {
+        if (msg) setLogs(prev => [...prev.slice(-199), `[${new Date().toLocaleTimeString()}] ${msg}`]);
+    }, []);
+
+    const applyStatus = useCallback((data: AutomationStatusResponse) => {
+        const snapshot = `${data.status}:${data.message || ''}`;
+        const firstSnapshot = lastSnapshot.current === '';
+        if (firstSnapshot && data.status === 'error') initialFailure.current = snapshot;
+        if (!firstSnapshot && snapshot !== initialFailure.current) initialFailure.current = null;
+        // Opening settings (including a tray-window reopen) must not present a
+        // previous attempt as a new error. A new job transition clears this.
+        const previousFailure = initialFailure.current === snapshot;
+        setStatus(previousFailure ? 'idle' : data.status);
+        setStatusMessage(previousFailure ? '' : data.message || '');
+        setError(!previousFailure && data.status === 'error' ? data.message || 'Sync failed.' : null);
+        if (snapshot !== lastSnapshot.current) {
+            lastSnapshot.current = snapshot;
+            if (!firstSnapshot) addLog(data.message || `Status: ${data.status}`);
+        }
+    }, [addLog]);
+
+    useEffect(() => {
+        let cancelled = false;
+        let timer: ReturnType<typeof setTimeout>;
+        const poll = async () => {
+            try {
+                const data = await api.checkStatus();
+                if (!cancelled) applyStatus(data);
+            } catch (err) {
+                if (!cancelled) setError(err instanceof Error ? err.message : 'Cannot reach the app service.');
+            } finally {
+                if (!cancelled) timer = setTimeout(poll, 5000);
+            }
+        };
+        void poll();
+        return () => { cancelled = true; clearTimeout(timer); };
+    }, [applyStatus]);
 
     const handleSaveSettings = async () => {
         setLoading(true);
@@ -72,8 +113,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
             await api.saveSettings({ daily_sync_time: dailySyncTime, email });
 
             const data = await api.startLogin(email);
-            addLog(data.message);
-            setStatus('otp_needed');
+            applyStatus(data);
         } catch (err: any) {
             setError(err.message);
             addLog(`Error: ${err.message}`);
@@ -88,8 +128,8 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
         addLog(`Submitting OTP...`);
         try {
             const data = await api.submitOtp(otp);
-            addLog(data.message);
-            setStatus('logged_in');
+            applyStatus(data);
+            if (data.status !== 'otp_needed') setOtp('');
         } catch (err: any) {
             setError(err.message);
             addLog(`Error: ${err.message}`);
@@ -104,40 +144,13 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
         addLog(`Requesting data export...`);
         try {
             const data = await api.requestExport();
-            addLog(data.message);
-            setStatus('exporting');
-            // Start polling
-            pollStatus();
+            applyStatus(data);
         } catch (err: any) {
             setError(err.message);
             addLog(`Error: ${err.message}`);
+        } finally {
             setLoading(false);
         }
-    };
-
-    const pollStatus = async () => {
-        const interval = setInterval(async () => {
-            try {
-                const data = await api.checkStatus();
-
-                if (data.status === 'completed' || data.status === 'ready_to_download') {
-                    clearInterval(interval);
-                    setStatus('ready_to_download');
-                    setLoading(false);
-                    addLog("Export ready for download!");
-                } else if (data.status === 'error') {
-                    clearInterval(interval);
-                    setStatus('error');
-                    setError("Export failed on server.");
-                    setLoading(false);
-                } else {
-                    // Still processing
-                    addLog(`Status: ${data.status}`);
-                }
-            } catch (err) {
-                console.error("Polling error", err);
-            }
-        }, 5000);
     };
 
     const handleDownload = async () => {
@@ -146,8 +159,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
         addLog(`Downloading and ingesting data...`);
         try {
             const data = await api.downloadExport();
-            addLog(data.message);
-            setStatus('completed');
+            applyStatus(data);
         } catch (err: any) {
             setError(err.message);
             addLog(`Error: ${err.message}`);
@@ -228,7 +240,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
                                         value={dailySyncTime}
                                         onChange={e => setDailySyncTime(e.target.value)}
                                     />
-                                    <Button onClick={handleSaveSettings} disabled={loading} variant="outline">
+                                    <Button onClick={handleSaveSettings} disabled={busy} variant="outline">
                                         Save
                                     </Button>
                                 </div>
@@ -244,23 +256,28 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
                                 <div className={cn("h-2.5 w-2.5 rounded-full",
                                     status === 'completed' ? "bg-green-500" :
                                         status === 'error' ? "bg-red-500" :
-                                            loading ? "bg-yellow-500 animate-pulse" : "bg-gray-500"
+                                            busy ? "bg-yellow-500 animate-pulse" : "bg-gray-500"
                                 )} />
                                 <span className="text-sm font-medium">
                                     {status === 'idle' && "Ready"}
                                     {status === 'login_needed' && "Login required"}
                                     {status === 'otp_needed' && "Enter OTP"}
                                     {status === 'logged_in' && "Logged in"}
-                                    {status === 'exporting' && "Exporting data..."}
+                                    {status === 'exporting' && "Waiting for Oura export"}
+                                    {status === 'downloading' && "Downloading and importing..."}
+                                    {status === 'initializing' && "Starting sync..."}
                                     {status === 'ready_to_download' && "Export ready"}
                                     {status === 'completed' && "Sync complete"}
                                     {status === 'error' && "Error occurred"}
                                 </span>
                             </div>
 
+                            {statusMessage && status !== 'otp_needed' && status !== 'error' && (
+                                <p className="text-sm text-muted-foreground" role="status">{statusMessage}</p>
+                            )}
                             <div className="grid grid-cols-1 gap-3">
                                 {/* Login Flow */}
-                                {status === 'idle' && (
+                                {!busy && status !== 'otp_needed' && (
                                     <div className="space-y-3 p-3 border rounded-lg">
                                         <Label>Login</Label>
                                         <Input
@@ -268,9 +285,9 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
                                             value={email}
                                             onChange={e => setEmail(e.target.value)}
                                         />
-                                        <Button className="w-full" onClick={handleStartLogin} disabled={!email || loading}>
+                                        <Button className="w-full" onClick={handleStartLogin} disabled={!email || busy}>
                                             {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                                            Start Login
+                                            {status === 'login_needed' ? 'Sign in again' : 'Sign in / Check session'}
                                         </Button>
                                     </div>
                                 )}
@@ -279,17 +296,23 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
                                     <div className="space-y-3 p-3 border rounded-lg bg-secondary/10">
                                         <Alert>
                                             <AlertCircle className="h-4 w-4" />
-                                            <AlertTitle>OTP Sent</AlertTitle>
-                                            <AlertDescription>Check your email.</AlertDescription>
+                                            <AlertTitle>Email code required</AlertTitle>
+                                            <AlertDescription>{statusMessage || 'Check your email. Sync is paused until you enter the code.'}</AlertDescription>
                                         </Alert>
                                         <Input
-                                            placeholder="OTP Code"
+                                            aria-label="Email verification code"
+                                            autoComplete="one-time-code"
+                                            inputMode="numeric"
+                                            placeholder="Email verification code"
                                             value={otp}
                                             onChange={e => setOtp(e.target.value)}
                                         />
-                                        <Button className="w-full" onClick={handleSubmitOtp} disabled={!otp || loading}>
+                                        <Button className="w-full" onClick={handleSubmitOtp} disabled={!otp || busy}>
                                             {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                                            Submit OTP
+                                            Verify code and continue
+                                        </Button>
+                                        <Button variant="outline" onClick={handleStartLogin} disabled={busy || !email}>
+                                            Request a new code
                                         </Button>
                                     </div>
                                 )}
@@ -301,7 +324,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
                                         <Button
                                             variant="outline"
                                             onClick={handleRequestExport}
-                                            disabled={loading || status === 'exporting'}
+                                            disabled={busy || status === 'otp_needed' || status === 'login_needed'}
                                             className="h-auto py-3 flex flex-col gap-1"
                                         >
                                             <span className="font-semibold">Request New</span>
@@ -310,7 +333,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
                                         <Button
                                             variant="outline"
                                             onClick={handleDownload}
-                                            disabled={loading}
+                                            disabled={busy || status === 'otp_needed' || status === 'login_needed'}
                                             className="h-auto py-3 flex flex-col gap-1"
                                         >
                                             <span className="font-semibold">Download Latest</span>
@@ -327,7 +350,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
                                             type="file"
                                             accept=".zip"
                                             onChange={handleFileUpload}
-                                            disabled={loading}
+                                            disabled={busy}
                                             className="cursor-pointer"
                                         />
                                     </div>
@@ -374,7 +397,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
                                 variant="destructive"
                                 className="w-full"
                                 onClick={handleClearSession}
-                                disabled={loading}
+                                disabled={busy}
                             >
                                 Clear Login Session
                             </Button>

@@ -4,6 +4,9 @@ import logging
 import re
 from playwright.async_api import async_playwright, expect, Page, BrowserContext, Browser
 from typing import Optional, Dict, Any, Union
+from urllib.parse import urlparse
+from pathlib import Path
+import shutil
 
 from .config import config_manager
 
@@ -22,7 +25,6 @@ class OuraAutomator:
         self.page: Optional[Page] = None
         self.playwright = None
         self._is_initialized = False
-        self.storage_state_path = os.path.join(os.getcwd(), "oura_session.json")
         self.email: Optional[str] = None
         self.password: Optional[str] = None
         self.base_url = "https://membership.ouraring.com"
@@ -30,6 +32,15 @@ class OuraAutomator:
 
         # Configure Playwright Browser Path
         from .paths import get_user_data_dir
+        data_dir = get_user_data_dir()
+        self.storage_state_path = str(data_dir / "oura_session.json")
+        # Import an existing session without deleting the original app's copy.
+        legacy_session = Path.cwd() / "oura_session.json"
+        migration_marker = data_dir / ".session-migrated"
+        if not migration_marker.exists() and not Path(self.storage_state_path).exists() and legacy_session.is_file():
+            shutil.copyfile(legacy_session, self.storage_state_path)
+            os.chmod(self.storage_state_path, 0o600)
+        migration_marker.touch(exist_ok=True)
         
         # Use a writable directory for browsers
         self.browser_dir = os.path.join(get_user_data_dir(), "browsers")
@@ -134,6 +145,7 @@ class OuraAutomator:
             await self.browser.close()
         if self.playwright:
             await self.playwright.stop()
+        self.page = self.context = self.browser = self.playwright = None
         self._is_initialized = False
         logger.info("OuraAutomator cleaned up.")
 
@@ -150,6 +162,7 @@ class OuraAutomator:
         """Saves current browser context (cookies/local storage) to disk."""
         if self.context:
             await self.context.storage_state(path=self.storage_state_path)
+            os.chmod(self.storage_state_path, 0o600)
             logger.info(f"Session saved to {self.storage_state_path}")
 
     # --- Login Logic ---
@@ -165,7 +178,7 @@ class OuraAutomator:
         logger.info("Checking login status...")
         try:
             # Check if already on the correct domain or redirect to it
-            if self.base_url in self.page.url:
+            if urlparse(self.page.url).netloc == urlparse(self.base_url).netloc:
                  pass
             else:
                  await self.page.goto(self.base_url, timeout=60000)
@@ -181,6 +194,11 @@ class OuraAutomator:
             if not self.email:
                 raise Exception("Login required but no email configured.")
 
+            # A background retry must not submit the email again or invalidate
+            # the code the user is currently entering.
+            if await self._check_otp_screen():
+                return {"status": "otp_required", "message": "Enter the code from your email."}
+
             return await self._perform_login_actions()
 
         except Exception as e:
@@ -190,8 +208,11 @@ class OuraAutomator:
     def _is_logged_in(self) -> bool:
         """Determines if user is logged in based on current URL."""
         if not self.page: return False
-        url = self.page.url.rstrip('/')
-        return (url == self.base_url) and ("login" not in url) and ("authn" not in url)
+        url = urlparse(self.page.url)
+        return (
+            url.netloc == urlparse(self.base_url).netloc
+            and url.path.rstrip('/') in ("", "/data-export")
+        )
 
     async def _perform_login_actions(self) -> Dict[str, str]:
         """Interacts with the login form, handling email submission and checking for OTP requirements."""
@@ -208,7 +229,7 @@ class OuraAutomator:
             raise Exception("Could not find email input.")
 
         await email_input.fill(self.email)
-        await self.page.dispatch_event("input[name='username']", 'input') 
+        await email_input.dispatch_event('input')
         
         await self._click_submit()
         
@@ -278,7 +299,7 @@ class OuraAutomator:
         if not self.page:
             return {"status": "error", "message": "Page not initialized"}
 
-        logger.info(f"Submitting OTP: {otp}")
+        logger.info("Submitting OTP code")
         try:
             # Locate OTP Input
             otp_selector = "input[name='otp']"
