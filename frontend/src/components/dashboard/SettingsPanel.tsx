@@ -24,6 +24,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
 
     const [statusMessage, setStatusMessage] = useState('');
     const lastSnapshot = useRef('');
+    const initialFailure = useRef<string | null>(null);
     const busy = loading || ['exporting', 'downloading', 'initializing'].includes(status);
 
     const [dailySyncTime, setDailySyncTime] = useState("09:00");
@@ -43,13 +44,19 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
     }, []);
 
     const applyStatus = useCallback((data: AutomationStatusResponse) => {
-        setStatus(data.status);
-        setStatusMessage(data.message || '');
-        setError(data.status === 'error' ? data.message || 'Sync failed.' : null);
         const snapshot = `${data.status}:${data.message || ''}`;
+        const firstSnapshot = lastSnapshot.current === '';
+        if (firstSnapshot && data.status === 'error') initialFailure.current = snapshot;
+        if (!firstSnapshot && snapshot !== initialFailure.current) initialFailure.current = null;
+        // Opening settings (including a tray-window reopen) must not present a
+        // previous attempt as a new error. A new job transition clears this.
+        const previousFailure = initialFailure.current === snapshot;
+        setStatus(previousFailure ? 'idle' : data.status);
+        setStatusMessage(previousFailure ? '' : data.message || '');
+        setError(!previousFailure && data.status === 'error' ? data.message || 'Sync failed.' : null);
         if (snapshot !== lastSnapshot.current) {
             lastSnapshot.current = snapshot;
-            addLog(data.message || `Status: ${data.status}`);
+            if (!firstSnapshot) addLog(data.message || `Status: ${data.status}`);
         }
     }, [addLog]);
 
