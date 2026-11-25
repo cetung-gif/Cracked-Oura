@@ -173,3 +173,25 @@ def test_restarted_otp_job_keeps_its_action_when_requesting_new_code():
         assert result["status"] == "otp_needed"
         assert result["pending_action"] == "download"
     asyncio.run(scenario())
+
+
+def test_restart_clears_stale_error_without_losing_diagnostics_or_sync_time():
+    sync = service(status="Error", message="No file downloaded (timeout?)",
+                   pending_action="download", last_run="2026-11-24 09:00:00")
+    sync.reset_after_restart()
+    assert sync.snapshot()["status"] == "idle"
+    assert sync.snapshot()["message"] == "Ready to sync."
+    assert sync.snapshot()["pending_action"] == ""
+    assert sync.snapshot()["last_run"] == "2026-11-24 09:00:00"
+    assert sync.config.get_config()["previous_sync_error"] == "No file downloaded (timeout?)"
+
+
+def test_new_error_after_restart_is_still_reported():
+    async def scenario():
+        sync = service(status="error", message="Old timeout")
+        sync.reset_after_restart()
+        sync.automator.download_existing_export.side_effect = RuntimeError("New network failure")
+        await sync.run("download")
+        assert sync.snapshot()["status"] == "error"
+        assert sync.snapshot()["message"] == "New network failure"
+    asyncio.run(scenario())
