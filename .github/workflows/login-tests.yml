@@ -1,15 +1,19 @@
-name: Login regression tests
+name: Automation regression tests
 
 on:
   push:
     paths:
-      - backend/src/automation.py
+      - backend/src/**
       - backend/tests/**
+      - frontend/src/components/dashboard/SettingsPanel.tsx
+      - frontend/src/lib/api.ts
       - .github/workflows/login-tests.yml
   pull_request:
     paths:
-      - backend/src/automation.py
+      - backend/src/**
       - backend/tests/**
+      - frontend/src/components/dashboard/SettingsPanel.tsx
+      - frontend/src/lib/api.ts
       - .github/workflows/login-tests.yml
 
 permissions:
@@ -27,3 +31,15 @@ jobs:
       - run: python -m pip install pytest playwright
       - run: python -m playwright install --with-deps chromium
       - run: python -m pytest backend/tests -q
+  frontend-types:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --include=dev --legacy-peer-deps --ignore-scripts
+        working-directory: frontend
+      - run: npx tsc -b
+        working-directory: frontend
