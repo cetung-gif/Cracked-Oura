@@ -28,6 +28,7 @@ from .schemas import (
 )
 from ..ingestion import OuraParser
 from ..sync_runtime import sync_service
+from ..sync import read_data_through
 from ..llm import DataAnalyst
 
 # Logging
@@ -477,6 +478,7 @@ async def ingest_zip(file: UploadFile = File(...), db: Session = Depends(get_db)
         logger.info(f"Received ZIP file, saved to {tmp_path}")
         
         parser.parse_zip(tmp_path)
+        sync_service.record_import({"data_through": read_data_through(db)})
         os.remove(tmp_path)
         
         return {"message": "Ingestion successful"}
