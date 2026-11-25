@@ -29,7 +29,7 @@ def test_export_state_and_request_dedup(automator_class, tmp_path, html, request
             browser = await playwright.chromium.launch()
             try:
                 page = await browser.new_page()
-                await page.set_content('<main><button>Unrelated action</button>'+html+'</main><script>window.clicked=[]; document.querySelectorAll("button").forEach(b=>b.onclick=()=>window.clicked.push(b.textContent));</script>')
+                await page.set_content('<main><button>Unrelated action</button>'+html+'</main><script>window.clicked=[]; document.querySelectorAll("button").forEach(b=>b.onclick=()=>{window.clicked.push(b.textContent); if(b.textContent === "Request your data") b.disabled=true;});</script>')
                 automator = automator_class.__new__(automator_class)
                 automator._is_initialized = True
                 automator.page = page

@@ -29,7 +29,7 @@ def service(**state):
     browser = SimpleNamespace(
         start_login=AsyncMock(return_value={"status": "otp_required"}),
         submit_otp=AsyncMock(return_value={"status": "success"}),
-        clear_session=AsyncMock(), cleanup=AsyncMock(),
+        clear_session=AsyncMock(), cleanup=AsyncMock(), save_context=AsyncMock(),
         check_export=AsyncMock(return_value={"status": "otp_required"}),
     )
     return SyncService(browser, MemoryConfig(**state), AsyncMock())
@@ -205,6 +205,7 @@ def test_pending_export_survives_restart_and_days_of_waiting():
         sync.automator.check_export.return_value = {"status": "pending"}
         await sync.run('export')
         assert sync.snapshot()['status'] == 'waiting_export'
+        sync.automator.save_context.assert_awaited_once()
         assert sync.snapshot()['export_pending'] is True
         first_check = sync.snapshot()['last_checked_at']
         assert sync.snapshot()['data_through'] is None
