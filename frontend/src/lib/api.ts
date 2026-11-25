@@ -1,9 +1,15 @@
 const BASE_URL = 'http://localhost:8000';
 
 export interface AutomationStatusResponse {
-    status: 'idle' | 'login_needed' | 'otp_needed' | 'logged_in' | 'exporting' | 'ready_to_download' | 'downloading' | 'completed' | 'error' | 'initializing';
+    status: 'idle' | 'login_needed' | 'otp_needed' | 'logged_in' | 'exporting' | 'ready_to_download' | 'downloading' | 'completed' | 'error' | 'initializing' | 'waiting_export';
     message?: string;
     pending_action?: 'export' | 'download' | '';
+    export_pending?: boolean;
+    export_requested_at?: string;
+    next_export_check_at?: string;
+    last_checked_at?: string;
+    last_imported_at?: string;
+    data_through?: string;
 }
 
 export interface ChatMessage {

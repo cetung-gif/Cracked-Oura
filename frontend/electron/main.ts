@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Tray, Menu, nativeImage } from 'electron';
+import { app, BrowserWindow, Tray, Menu, nativeImage, Notification } from 'electron';
 import path from 'path';
 import { spawn, ChildProcess } from 'child_process';
 
@@ -230,10 +230,30 @@ function startPythonBackend() {
     }
 }
 
+let lastAuthNotice = '';
+let noticeTimer: ReturnType<typeof setInterval> | undefined;
+async function checkAuthNotice() {
+    try {
+        const response = await fetch('http://127.0.0.1:8000/api/automation/status');
+        if (!response.ok) return;
+        const state = await response.json();
+        const needsAuth = state.status === 'otp_needed' || state.status === 'login_needed';
+        if (!needsAuth) { lastAuthNotice = ''; return; }
+        const key = `${state.status}:${state.pending_action || ''}`;
+        if (key === lastAuthNotice || !Notification.isSupported()) return;
+        lastAuthNotice = key;
+        const notice = new Notification({title: 'Cracked Oura needs you to sign in',
+            body: 'Open Settings → Automation to enter your email code and continue syncing.'});
+        notice.on('click', () => { mainWindow?.show(); mainWindow?.focus(); });
+        notice.show();
+    } catch { /* Backend may still be starting; retry on the next check. */ }
+}
+
 app.on('ready', () => {
     startPythonBackend();
     createWindow();
     createTray();
+    noticeTimer = setInterval(checkAuthNotice, 15000);
 });
 
 app.on('window-all-closed', () => {
@@ -258,6 +278,7 @@ app.on('before-quit', () => {
 });
 
 app.on('will-quit', () => {
+    if (noticeTimer) clearInterval(noticeTimer);
     if (pythonProcess) {
         pythonProcess.kill();
     }

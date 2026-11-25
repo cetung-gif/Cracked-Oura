@@ -22,6 +22,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
     const [logs, setLogs] = useState<string[]>([]);
     const [activeTab, setActiveTab] = useState<'automation' | 'layout'>('automation');
 
+    const [syncInfo, setSyncInfo] = useState<AutomationStatusResponse | null>(null);
     const [statusMessage, setStatusMessage] = useState('');
     const lastSnapshot = useRef('');
     const initialFailure = useRef<string | null>(null);
@@ -44,6 +45,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
     }, []);
 
     const applyStatus = useCallback((data: AutomationStatusResponse) => {
+        setSyncInfo(data);
         const snapshot = `${data.status}:${data.message || ''}`;
         const firstSnapshot = lastSnapshot.current === '';
         if (firstSnapshot && data.status === 'error') initialFailure.current = snapshot;
@@ -141,7 +143,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
     const handleRequestExport = async () => {
         setLoading(true);
         setError(null);
-        addLog(`Requesting data export...`);
+        addLog(syncInfo?.export_pending ? 'Checking the pending export...' : 'Checking existing exports before requesting new data...');
         try {
             const data = await api.requestExport();
             applyStatus(data);
@@ -179,7 +181,8 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
         try {
             const data = await api.uploadZip(file);
             addLog(data.message || "Upload complete");
-            setStatus('completed');
+            const current = await api.checkStatus();
+            applyStatus(current);
         } catch (err: any) {
             setError(err.message);
             addLog(`Error: ${err.message}`);
@@ -233,7 +236,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
                         <div className="space-y-4">
                             <h3 className="font-medium text-sm text-muted-foreground uppercase tracking-wider">Configuration</h3>
                             <div className="space-y-2">
-                                <Label>Daily Sync Time</Label>
+                                <Label>Daily export check</Label>
                                 <div className="flex gap-2">
                                     <Input
                                         type="time"
@@ -263,7 +266,8 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
                                     {status === 'login_needed' && "Login required"}
                                     {status === 'otp_needed' && "Enter OTP"}
                                     {status === 'logged_in' && "Logged in"}
-                                    {status === 'exporting' && "Waiting for Oura export"}
+                                    {status === 'exporting' && "Checking Oura..."}
+                                    {status === 'waiting_export' && "Waiting for Oura"}
                                     {status === 'downloading' && "Downloading and importing..."}
                                     {status === 'initializing' && "Starting sync..."}
                                     {status === 'ready_to_download' && "Export ready"}
@@ -275,6 +279,19 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
                             {statusMessage && status !== 'otp_needed' && status !== 'error' && (
                                 <p className="text-sm text-muted-foreground" role="status">{statusMessage}</p>
                             )}
+                            <dl className="space-y-2 text-sm" aria-label="Data freshness">
+                                <div><dt className="text-muted-foreground">Data available through</dt>
+                                    <dd>{syncInfo?.data_through ? new Date(`${syncInfo.data_through}T12:00:00`).toLocaleDateString() : 'No imported data yet'}</dd></div>
+                                <div><dt className="text-muted-foreground">Last checked</dt>
+                                    <dd>{syncInfo?.last_checked_at ? new Date(syncInfo.last_checked_at).toLocaleString() : 'Not checked yet'}</dd></div>
+                                <div><dt className="text-muted-foreground">Last imported</dt>
+                                    <dd>{syncInfo?.last_imported_at ? new Date(syncInfo.last_imported_at).toLocaleString() : 'Not imported yet'}</dd></div>
+                                {syncInfo?.export_pending && <div><dt className="text-muted-foreground">Export request</dt>
+                                    <dd>{syncInfo.export_requested_at ? `Pending since ${new Date(syncInfo.export_requested_at).toLocaleString()}` : 'Pending with Oura'}</dd></div>}
+                                {syncInfo?.next_export_check_at && <div><dt className="text-muted-foreground">Next export check</dt>
+                                    <dd>{new Date(syncInfo.next_export_check_at).toLocaleString()}</dd></div>}
+                            </dl>
+                            <p className="text-xs text-muted-foreground">Checks resume while the app is running and your Mac is awake. Waiting for an export does not mean new data has arrived.</p>
                             <div className="grid grid-cols-1 gap-3">
                                 {/* Login Flow */}
                                 {!busy && status !== 'otp_needed' && (
@@ -327,8 +344,8 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
                                             disabled={busy || status === 'otp_needed' || status === 'login_needed'}
                                             className="h-auto py-3 flex flex-col gap-1"
                                         >
-                                            <span className="font-semibold">Request New</span>
-                                            <span className="text-xs font-normal text-muted-foreground">Request & Wait</span>
+                                            <span className="font-semibold">{syncInfo?.export_pending ? 'Check export' : 'Request New'}</span>
+                                            <span className="text-xs font-normal text-muted-foreground">{syncInfo?.export_pending ? 'Keep existing request' : 'Create if needed'}</span>
                                         </Button>
                                         <Button
                                             variant="outline"

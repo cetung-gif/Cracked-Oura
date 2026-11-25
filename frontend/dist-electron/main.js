@@ -212,10 +212,35 @@ function startPythonBackend() {
         logToDesktop("pythonProcess is undefined after attempt!");
     }
 }
+let lastAuthNotice = '';
+let noticeTimer;
+async function checkAuthNotice() {
+    try {
+        const response = await fetch('http://127.0.0.1:8000/api/automation/status');
+        if (!response.ok)
+            return;
+        const state = await response.json();
+        const needsAuth = state.status === 'otp_needed' || state.status === 'login_needed';
+        if (!needsAuth) {
+            lastAuthNotice = '';
+            return;
+        }
+        const key = `${state.status}:${state.pending_action || ''}`;
+        if (key === lastAuthNotice || !electron_1.Notification.isSupported())
+            return;
+        lastAuthNotice = key;
+        const notice = new electron_1.Notification({ title: 'Cracked Oura needs you to sign in',
+            body: 'Open Settings → Automation to enter your email code and continue syncing.' });
+        notice.on('click', () => { mainWindow?.show(); mainWindow?.focus(); });
+        notice.show();
+    }
+    catch { /* Backend may still be starting; retry on the next check. */ }
+}
 electron_1.app.on('ready', () => {
     startPythonBackend();
     createWindow();
     createTray();
+    noticeTimer = setInterval(checkAuthNotice, 15000);
 });
 electron_1.app.on('window-all-closed', () => {
     // Do NOT quit. We want to stay alive in the tray.
@@ -237,6 +262,8 @@ electron_1.app.on('before-quit', () => {
     isQuitting = true;
 });
 electron_1.app.on('will-quit', () => {
+    if (noticeTimer)
+        clearInterval(noticeTimer);
     if (pythonProcess) {
         pythonProcess.kill();
     }

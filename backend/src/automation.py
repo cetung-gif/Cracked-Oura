@@ -334,69 +334,67 @@ class OuraAutomator:
 
     # --- Data Export Logic ---
 
-    async def request_new_export_and_download(self, save_dir: str) -> Optional[str]:
-        """
-        Orchestrates the entire data export flow:
-        1. Navigate to export page.
-        2. Request a new export (if not already processing).
-        3. Wait for Oura to generate the export (polling).
-        4. Download the file.
-        """
-        logger.info("Starting Data Request Flow...")
+    def _download_control(self):
+        name = re.compile(r"^Download(?: data| export| file)?$", re.IGNORECASE)
+        return self.page.get_by_role("button", name=name).or_(
+            self.page.get_by_role("link", name=name)
+        ).first
+
+    def _request_control(self):
+        return self.page.get_by_role(
+            "button", name=re.compile(
+                r"^Request (?:your data|data(?: export)?|(?:a |new )?export)$", re.IGNORECASE
+            )
+        ).first
+
+    async def _export_is_pending(self):
+        pending = self.page.get_by_text(re.compile(
+            r"^(?:pending|processing|in progress|preparing(?: your data| export)?|"
+            r"export (?:pending|requested|in progress)|request pending)[.!…]*$", re.IGNORECASE
+        )).first
+        if await pending.is_visible():
+            return True
+        request = self._request_control()
+        return (await request.is_visible() and not await request.is_enabled()
+                and not await self._download_control().is_visible())
+
+    async def check_export(self, save_dir, *, request_if_missing=False,
+                           export_pending=False, skip_download=False, before_request=None):
+        """Make one export-page check; the persistent manager schedules later checks."""
         if not self._is_initialized:
             await self.initialize()
-
         if not self.page:
             self.page = await self.context.new_page()
-
-        try:
-            # 1. Navigate
-            if not await self._navigate_to_export_page():
-                # Check if stuck on Login/OTP
-                if "login" in self.page.url or "authn" in self.page.url:
-                     return {"status": "otp_required"}
-                return None
-
-            # 2. Click Request Button (if available)
-            if await self._click_request_export_button():
-                logger.info("Export requested. Waiting for processing...")
-            else:
-                logger.info("Export might already be requested or button not found.")
-
-            # 3. Wait for Processing
-            is_ready = await self._wait_for_processing()
-            if not is_ready:
-                logger.warning("Timed out waiting for export processing.")
-                return None
-
-            # 4. Download
-            return await self._download_file(save_dir)
-
-        except Exception as e:
-            logger.error(f"Request automation failed: {e}")
-            return None
-
-    async def download_existing_export(self, save_dir: str) -> Optional[str]:
-        """
-        Attempts to download an existing export without requesting a new one.
-        Useful for quick checks or retrying a download.
-        """
-        logger.info("Starting Download Only Flow...")
-        if not self._is_initialized:
-            await self.initialize()
-
-        if not self.page:
-            self.page = await self.context.new_page()
-
-        try:
-            if not await self._navigate_to_export_page():
-                return {"status": "otp_required"}
-
-            return await self._download_file(save_dir)
-
-        except Exception as e:
-            logger.error(f"Download automation failed: {e}")
-            return {"status": "error", "message": str(e)}
+        if not await self._navigate_to_export_page():
+            return {"status": "otp_required"}
+        await self.page.locator("main").wait_for(state="visible", timeout=15000)
+        if await self._export_is_pending():
+            return {"status": "pending"}
+        download = self._download_control()
+        if not skip_download and await download.is_visible() and await download.is_enabled():
+            return {"status": "downloaded", "path": await self._download_file(save_dir)}
+        # A saved request must never be submitted a second time, even if the
+        # app closed between the click and Oura's confirmation.
+        if export_pending and (await self._request_control().is_visible() or await download.is_visible()):
+            return {"status": "pending"}
+        request = self._request_control()
+        if request_if_missing and await request.is_visible() and await request.is_enabled():
+            if before_request:
+                before_request()
+            await request.click(timeout=10000)
+            # A SPA click can return before the request reaches Oura. Keep the
+            # browser alive for confirmation instead of cancelling its POST.
+            for _ in range(20):
+                if await self._export_is_pending():
+                    return {"status": "pending", "requested": True}
+                if await download.is_visible() and await download.is_enabled():
+                    return {"status": "downloaded", "path": await self._download_file(save_dir)}
+                await self.page.wait_for_timeout(500)
+            # Never submit twice when the outcome is uncertain.
+            return {"status": "pending", "request_unconfirmed": True}
+        if await request.is_visible() or await download.is_visible():
+            return {"status": "no_export"}
+        raise RuntimeError("Could not identify Oura's export controls. Open the export page to check its status.")
 
     async def _navigate_to_export_page(self) -> bool:
         """Navigates to the export page, handling potential login redirects and re-tries."""
@@ -438,77 +436,9 @@ class OuraAutomator:
              
         return True
 
-    async def _click_request_export_button(self) -> bool:
-        """Finds and clicks the 'Request data export' button, handling various states (disabled, aria attributes)."""
-        # Find Request Button (Try likely selectors)
-        target_btn = self.page.locator('[data-testid="pageSubtitle"] + button').first
-        try:
-             await target_btn.wait_for(state="visible", timeout=5000)
-        except:
-             pass
-
-        if not await target_btn.is_visible():
-            target_btn = self.page.locator('main button').first
-            try:
-                 await target_btn.wait_for(state="visible", timeout=5000)
-            except:
-                 pass
-
-        if not await target_btn.is_visible():
-            return False
-
-        # Wait briefly for hydration
-        await self.page.wait_for_timeout(5000)
-
-        # Check if explicitly disabled in DOM
-        is_disabled = await target_btn.get_attribute("disabled") is not None
-        aria_disabled = await target_btn.get_attribute("aria-disabled") == "true"
-
-        if is_disabled or aria_disabled:
-             return False
-
-        # Attempt Click 
-        try:
-            # We try to wait for enabled state, but don't strictly block on it in case of UI quirks
-            try:
-                 await target_btn.wait_for(state="enabled", timeout=3000)
-            except:
-                 pass 
-            
-            logger.info("Found Request button. Clicking...")
-            await target_btn.click(timeout=5000)
-            
-            # Wait for state change confirmation
-            await self.page.wait_for_timeout(2000)
-            return True
-        except Exception as e:
-            logger.error(f"Click failed: {e}")
-            return False
-
-    async def _wait_for_processing(self) -> bool:
-        """Polls until the request button is re-enabled, indicating report generation is complete."""
-        max_retries = 30 # Approx 2.5 hours total wait time
-        poll_interval = 300 # 5 minutes between checks
-        
-        for i in range(max_retries):
-            # Check if Request button is enabled again (indicating download is ready)
-            request_btn = self.page.locator('[data-testid="pageSubtitle"] + button').first
-            if not await request_btn.is_visible():
-                request_btn = self.page.locator('main button').first
-            
-            if await request_btn.is_visible() and await request_btn.is_enabled():
-                return True # Export is ready
-            
-            logger.info(f"Processing... (Attempt {i+1}/{max_retries}) - Next check in {poll_interval}s")
-            await self.page.wait_for_timeout(poll_interval * 1000)
-            await self.page.reload()
-            await self.page.wait_for_load_state("networkidle")
-            
-        return False
-
     async def _download_file(self, save_dir: str) -> Optional[str]:
         """Finds the download button and handles the file save dialog."""
-        download_btn = self.page.locator("button[aria-label='Download data']").first
+        download_btn = self._download_control()
         try:
             await download_btn.wait_for(state="visible", timeout=10000)
         except:
@@ -520,7 +450,7 @@ class OuraAutomator:
                 await download_btn.click()
             
             download = await download_info.value
-            filename = download.suggested_filename
+            filename = Path(download.suggested_filename).name
             save_path = os.path.join(save_dir, filename)
             await download.save_as(save_path)
             logger.info(f"Downloaded to {save_path}")

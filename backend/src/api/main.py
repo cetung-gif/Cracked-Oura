@@ -5,10 +5,9 @@ from backend.src.database import init_db
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
 from backend.src.automation import automator
 from backend.src.config import config_manager
-from backend.src.sync_runtime import sync_service
+from backend.src.sync_runtime import sync_service, refresh_freshness
 import os
 from pydantic import BaseModel
 
@@ -35,6 +34,7 @@ logger.info(f"API Starting... Logging to {log_file}")
 async def lifespan(app: FastAPI):
     # Startup
     init_db()
+    refresh_freshness()
     
     sync_service.reset_after_restart()
     task = asyncio.create_task(background_worker())
@@ -105,20 +105,11 @@ async def update_automation_config(config: AutomationConfig):
 # The scheduler uses the same service so it cannot restart an OTP challenge.
 async def background_worker():
     logger.info("Background worker started.")
-    last_scheduled_day = None
     while True:
         try:
-            now = datetime.now()
-            cfg = config_manager.get_config()
-            sh, sm = map(int, cfg.get("schedule_time", "11:00").split(":"))
-            run_today = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
-            next_run = run_today if now < run_today else run_today + timedelta(days=1)
-            config_manager.update_config(next_run=next_run.strftime("%Y-%m-%d %H:%M:%S"))
-            if (now.hour, now.minute) == (sh, sm) and last_scheduled_day != now.date():
-                last_scheduled_day = now.date()
-                await sync_service.run("export", scheduled=True)
+            await sync_service.tick()
         except Exception:
-            logger.exception("Scheduled sync failed")
+            logger.exception("Scheduled export check failed")
         await asyncio.sleep(60)
 
 # Mount Static Files
