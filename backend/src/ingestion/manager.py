@@ -29,20 +29,26 @@ class OuraParser(IngestionBase):
                 with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                     zip_ref.extractall(temp_dir)
             except zipfile.BadZipFile:
-                logger.error(f"Error: Invalid ZIP file at {zip_path}")
-                return
+                raise ValueError("This file is not a valid Oura export ZIP.")
             
             # Recursively search for a directory containing data files
             target_dir = temp_dir
             found_csvs = []
+            supported = {
+                "dailysleep.csv", "dailyactivity.csv", "dailyreadiness.csv", "sleeptime.csv",
+                "dailyspo2.csv", "dailystress.csv", "daytimestress.csv", "sleepmodel.csv",
+                "workout.csv", "session.csv", "heartrate.csv", "temperature.csv",
+                "ringconfiguration.csv", "enhancedtag.csv", "dailycardiovascularage.csv",
+                "ringbatterylevel.csv", "dailyresilience.csv",
+            }
             for root, dirs, files in os.walk(temp_dir):
-                if "dailysleep.csv" in files or "dailyactivity.csv" in files:
+                if supported.intersection(files):
                     target_dir = root
                     found_csvs = files
                     break
             
             if not found_csvs:
-                 logger.warning("No Oura CSV files found in the ZIP archive!")
+                 raise ValueError("No supported Oura CSV data was found in this ZIP.")
             else:
                  logger.info(f"Found data in: {target_dir}")
             
