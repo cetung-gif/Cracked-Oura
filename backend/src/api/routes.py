@@ -27,7 +27,7 @@ from .schemas import (
     ResilienceResponse, TemperatureResponse, MeditationResponse
 )
 from ..ingestion import OuraParser
-from ..automation import automator
+from ..sync_runtime import sync_service
 from ..llm import DataAnalyst
 
 # Logging
@@ -73,57 +73,6 @@ class IngestRequest(BaseModel):
 # Background Tasks
 # -----------------------------------------------------------------------------
 
-async def run_full_sync_task(db_session_factory):
-    """
-    Executes the full synchronization process:
-    1. Request export from Oura Cloud (via playwright).
-    2. Wait for export generation.
-    3. Download the export zip.
-    4. Ingest data into the local SQLite database.
-    """
-    config_manager.update_status("Processing", message="Starting full sync...")
-    try:
-        # Create temp dir for the download
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_manager.update_status("Processing", message="Requesting and waiting for export (this may take hours)...")
-            
-            # This step blocks while waiting for Oura to generate the export
-            result = await automator.request_new_export_and_download(temp_dir)
-            
-            # Handle OTP requirement
-            if isinstance(result, dict) and result.get("status") == "otp_required":
-                config_manager.update_status("Error", message="OTP required. Please login manually in settings.")
-                logger.warning("Full sync failed: OTP required.")
-                return
-
-            zip_path = result
-            
-            # Process successfully downloaded file
-            if zip_path and isinstance(zip_path, str):
-                config_manager.update_status("Processing", message=f"Downloaded to {zip_path}. Ingesting...")
-                logger.info(f"Full sync: Downloaded to {zip_path}. Ingesting...")
-                
-                # Ingest into Database
-                db = db_session_factory()
-                try:
-                    parser = OuraParser(db)
-                    parser.parse_zip(zip_path)
-                    logger.info("Full sync: Ingestion complete.")
-                    
-                    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    config_manager.update_status("Idle", message="Sync and ingestion complete!", last_run=now_str)
-                finally:
-                    db.close()
-            else:
-                logger.error("Full sync failed: No file downloaded.")
-                config_manager.update_status("Error", message="No file downloaded (timeout?)")
-                
-    except Exception as e:
-        logger.error(f"Full sync task error: {e}")
-        config_manager.update_status("Error", message=f"Sync failed: {e}")
-    finally:
-        await automator.cleanup()
-
 # -----------------------------------------------------------------------------
 # Chat / Advisor Endpoints
 # -----------------------------------------------------------------------------
@@ -150,75 +99,65 @@ async def chat(request: ChatRequest):
 # Automation & Authentication Endpoints
 # -----------------------------------------------------------------------------
 
-@router.post("/api/automation/start-login")
-async def start_login(request: LoginRequest):
-    """Initiates the login process via Playwright."""
+def require_sync_available():
     try:
-        result = await automator.start_login(request.email)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        sync_service.require_available()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/api/automation/start-login")
+async def start_login(request: LoginRequest, background_tasks: BackgroundTasks):
+    require_sync_available()
+    result = await sync_service.start_login(request.email)
+    action = result.get("pending_action")
+    if result["status"] == "logged_in" and action in {"export", "download"}:
+        sync_service.prepare(action)
+        background_tasks.add_task(sync_service.run, action)
+        return sync_service.snapshot()
+    return result
+
 
 @router.post("/api/automation/submit-otp")
-async def submit_otp(request: OTPRequest):
-    """Submits the OTP code to the active Playwright session."""
+async def submit_otp(request: OTPRequest, background_tasks: BackgroundTasks):
     try:
-        result = await automator.submit_otp(request.otp)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        result, action = await sync_service.submit_otp(request.otp)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    if action:
+        background_tasks.add_task(sync_service.run, action)
+    return result
+
 
 @router.post("/api/automation/request-export")
 async def request_export(background_tasks: BackgroundTasks):
-    """
-    Starts the full export -> wait -> download -> ingest process in the background.
-    """
-    cfg = config_manager.get_config()
-    if cfg.get("status") == "Processing":
-        raise HTTPException(status_code=409, detail="Sync already in progress")
-        
-    background_tasks.add_task(run_full_sync_task, SessionLocal)
-    return {"message": "Full sync started in background."}
+    try:
+        sync_service.prepare("export")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    background_tasks.add_task(sync_service.run, "export")
+    return sync_service.snapshot()
+
 
 @router.post("/api/automation/check-status")
 async def check_status():
-    """Returns the current automation status from the persistent config."""
-    return config_manager.get_config()
+    return sync_service.snapshot()
+
 
 @router.post("/api/automation/download")
-async def download_export(db: Session = Depends(get_db)):
-    """
-    Attempts to download an *existing* export from Oura Cloud and ingest it.
-    Does not request a new export generation.
-    """
+async def download_export(background_tasks: BackgroundTasks):
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            zip_path = await automator.download_existing_export(temp_dir)
-            
-            if isinstance(zip_path, dict) and zip_path.get("status") == "error":
-                raise HTTPException(status_code=500, detail=f"Download failed: {zip_path.get('message')}")
-            
-            if not zip_path:
-                raise HTTPException(status_code=500, detail="Download failed: Button not found or timeout.")
+        sync_service.prepare("download")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    background_tasks.add_task(sync_service.run, "download")
+    return sync_service.snapshot()
 
-            # Ingest
-            parser = OuraParser(db)
-            parser.parse_zip(zip_path)
-            
-            return {"message": "Download and ingestion successful!"}
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/api/automation/clear-session")
 async def clear_session():
-    """Clears the automation session (cookies/storage)."""
-    try:
-        await automator.clear_session()
-        return {"message": "Session cleared"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    require_sync_available()
+    return await sync_service.clear_session()
 
 # -----------------------------------------------------------------------------
 # Settings Endpoints
